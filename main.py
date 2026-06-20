@@ -1,73 +1,71 @@
-import modal
-import subprocess
-import os
-import base64
+#!/usr/bin/env bash
 
-INSTALL_SCRIPT_VERSION = 2
+# 1. 設置工作目錄 (規避系統目錄唯讀限制)
+export WORK_DIR="/tmp/app"
+mkdir -p $WORK_DIR
+cd $WORK_DIR
 
-# Optional deploy-time settings (read when `modal deploy` loads this file):
-#   MODAL_REGION            Comma-separated region ids (e.g. "us-east" or "ap-northeast-1,eu-west-1").
-#                           Unset or empty = Modal default scheduling (no fixed region).
-#                           See https://modal.com/docs/guide/region-selection
-#   MODAL_NONPREEMPTIBLE    Set to the string "true" to enable nonpreemptible on the Function; omit or "false" otherwise.
-def _modal_function_options():
-    """Build optional kwargs for @app.function from environment (CI / local deploy)."""
-    opts = {}
-    raw_region = os.environ.get("MODAL_REGION", "").strip()
-    if raw_region:
-        parts = [p.strip() for p in raw_region.split(",") if p.strip()]
-        if parts:
-            opts["region"] = parts
-    if os.environ.get("MODAL_NONPREEMPTIBLE", "").strip() == "true":
-        opts["nonpreemptible"] = True
-    return opts
+XRAY_VERSION="26.3.27"
+ARGO_VERSION="2026.3.0"
+TTYD_VERSION="1.7.7"
+SUPERCRONIC_VERSION="0.2.44"
 
-app = modal.App("vevc-app")
-vevc_image = (
-    modal.Image.debian_slim()
-        .apt_install("curl", "unzip", "supervisor", "procps")
-        .run_commands(
-            f'curl -sSL "https://raw.githubusercontent.com/vevc/modal-deploy/refs/heads/main/install.sh?v={INSTALL_SCRIPT_VERSION}" | bash'
-        )
-        .pip_install("fastapi[standard]")
-)
+# 2. 下載組件 (增加 User-Agent 防止被拒絕)
+curl -sSL -H "User-Agent: Mozilla/5.0" -o Xray.zip https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip
+unzip -q Xray.zip && mv xray xy && chmod +x xy
 
-_supervisor_started = False
+curl -sSL -H "User-Agent: Mozilla/5.0" -o cf https://github.com/cloudflare/cloudflared/releases/download/$ARGO_VERSION/cloudflared-linux-amd64 && chmod +x cf
+curl -sSL -H "User-Agent: Mozilla/5.0" -o td https://github.com/tsl0922/ttyd/releases/download/$TTYD_VERSION/ttyd.x86_64 && chmod +x td
+curl -sSL -H "User-Agent: Mozilla/5.0" -o sc https://github.com/aptible/supercronic/releases/download/v$SUPERCRONIC_VERSION/supercronic-linux-amd64 && chmod +x sc
 
-def start_supervisor():
-    global _supervisor_started
-    if not _supervisor_started:
-        os.environ["ENABLE_SC"] = "true" if "E" in os.environ else "false"
-        subprocess.run(["supervisord"], env=os.environ.copy())
-        _supervisor_started = True
+# 3. 準備配置文件與啟動腳本
+curl -sSL -o xy.json https://raw.githubusercontent.com/vevc/modal-deploy/refs/heads/main/xray-config.json
 
-@app.function(
-    image=vevc_image,
-    secrets=[modal.Secret.from_name("custom-secret")],
-    min_containers=1,
-    max_containers=1,
-    scaledown_window=1200,
-    **_modal_function_options(),
-)
-@modal.asgi_app()
-def main():
-    from fastapi import FastAPI
-    from fastapi.responses import PlainTextResponse
+cat > start_xy.sh <<'EOF'
+#!/usr/bin/env bash
+sed -i "s/YOUR_UUID/$U/g" /tmp/app/xy.json
+exec /tmp/app/xy -c /tmp/app/xy.json
+EOF
+chmod +x start_xy.sh
 
-    start_supervisor()
-    web_app = FastAPI()
-    uuid = os.environ["U"]
+# 4. 產生 Supervisor 設定檔 (解決路徑警告)
+mkdir -p /tmp/supervisor/conf.d
+cat > /tmp/supervisor/supervisord.conf <<EOF
+[supervisord]
+nodaemon=true
+user=root
+logfile=/dev/null
+pidfile=/tmp/supervisord.pid
 
-    @web_app.get("/status", response_class=PlainTextResponse)
-    async def status():
-        start_supervisor()
-        return "UP"
+[include]
+files = /tmp/supervisor/conf.d/*.conf
+EOF
 
-    @web_app.get(f"/{uuid}", response_class=PlainTextResponse)
-    async def sub():
-        start_supervisor()
-        domain = os.environ["D"]
-        sub_url = f"vless://{uuid}@{domain}:443?encryption=none&security=tls&sni={domain}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host={domain}&path=%2F%3Fed%3D2560#modal-ws-argo"
-        return base64.b64encode(sub_url.encode("utf-8"))
+# 5. 產生各項服務配置
+cat > /tmp/supervisor/conf.d/services.conf <<EOF
+[program:xy]
+command=/tmp/app/start_xy.sh
+autostart=true
+autorestart=true
+environment=U="%(ENV_U)s"
 
-    return web_app
+[program:cf]
+command=/tmp/app/cf tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token %(ENV_T)s
+autostart=true
+autorestart=true
+
+[program:td]
+command=/tmp/app/td -p 80 -W bash
+autostart=true
+autorestart=true
+
+[program:sc]
+command=/tmp/app/sc /tmp/app/my-crontab
+autostart=%(ENV_ENABLE_SC)s
+autorestart=true
+EOF
+
+# 6. Crontab 準備
+cat > /tmp/app/my-crontab <<EOF
+*/5 * * * * curl -o /dev/null -s \$E/status
+EOF
