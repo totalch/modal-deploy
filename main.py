@@ -1,71 +1,78 @@
-#!/usr/bin/env bash
+import modal
+import subprocess
+import os
+import base64
 
-# 1. 設置工作目錄 (規避系統目錄唯讀限制)
-export WORK_DIR="/tmp/app"
-mkdir -p $WORK_DIR
-cd $WORK_DIR
+# --- 第一部分：變數與配置定義 ---
+INSTALL_SCRIPT_VERSION = 2
 
-XRAY_VERSION="26.3.27"
-ARGO_VERSION="2026.3.0"
-TTYD_VERSION="1.7.7"
-SUPERCRONIC_VERSION="0.2.44"
+# --- 第二部分：選項函式 ---
+def _modal_function_options():
+    opts = {}
+    raw_region = os.environ.get("MODAL_REGION", "").strip()
+    if raw_region:
+        parts = [p.strip() for p in raw_region.split(",") if p.strip()]
+        if parts:
+            opts["region"] = parts
+    if os.environ.get("MODAL_NONPREEMPTIBLE", "").strip() == "true":
+        opts["nonpreemptible"] = True
+    return opts
 
-# 2. 下載組件 (增加 User-Agent 防止被拒絕)
-curl -sSL -H "User-Agent: Mozilla/5.0" -o Xray.zip https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip
-unzip -q Xray.zip && mv xray xy && chmod +x xy
+# --- 第三部分：Image 定義 ---
+vevc_image = (
+    modal.Image.debian_slim()
+    .apt_install("curl", "unzip", "supervisor", "procps")
+    .run_commands(
+        # 1. 下載安裝腳本
+        f'curl -sSL "https://raw.githubusercontent.com/heartnathan/modal-deploy/refs/heads/main/install.sh?v={INSTALL_SCRIPT_VERSION}" | bash',
+        # 2. 建立目錄
+        "mkdir -p /tmp/supervisor/conf.d",
+        # 3. 最穩定的寫入方式：直接在指令中完成，不使用 Python 變數
+        "printf '[supervisord]\\nnodaemon=true\\nlogfile=/dev/null\\npidfile=/tmp/supervisord.pid\\n\\n[include]\\nfiles = /tmp/supervisor/conf.d/*.conf' > /tmp/supervisor/supervisord.conf"
+    )
+    .pip_install("fastapi[standard]")
+)
 
-curl -sSL -H "User-Agent: Mozilla/5.0" -o cf https://github.com/cloudflare/cloudflared/releases/download/$ARGO_VERSION/cloudflared-linux-amd64 && chmod +x cf
-curl -sSL -H "User-Agent: Mozilla/5.0" -o td https://github.com/tsl0922/ttyd/releases/download/$TTYD_VERSION/ttyd.x86_64 && chmod +x td
-curl -sSL -H "User-Agent: Mozilla/5.0" -o sc https://github.com/aptible/supercronic/releases/download/v$SUPERCRONIC_VERSION/supercronic-linux-amd64 && chmod +x sc
+app = modal.App("vevc-app")
 
-# 3. 準備配置文件與啟動腳本
-curl -sSL -o xy.json https://raw.githubusercontent.com/vevc/modal-deploy/refs/heads/main/xray-config.json
+def start_supervisor():
+    global _supervisor_started
+    if not _supervisor_started:
+        env = os.environ.copy()
+        env["ENABLE_SC"] = "true" if "E" in env else "false"
+        # 關鍵：強制使用我們剛才寫入的絕對路徑設定檔
+        cmd = ["/usr/bin/supervisord", "-c", "/tmp/supervisor/supervisord.conf"]
+        subprocess.Popen(cmd, env=env)
+        _supervisor_started = True
 
-cat > start_xy.sh <<'EOF'
-#!/usr/bin/env bash
-sed -i "s/YOUR_UUID/$U/g" /tmp/app/xy.json
-exec /tmp/app/xy -c /tmp/app/xy.json
-EOF
-chmod +x start_xy.sh
+_supervisor_started = False
 
-# 4. 產生 Supervisor 設定檔 (解決路徑警告)
-mkdir -p /tmp/supervisor/conf.d
-cat > /tmp/supervisor/supervisord.conf <<EOF
-[supervisord]
-nodaemon=true
-user=root
-logfile=/dev/null
-pidfile=/tmp/supervisord.pid
+# --- 第四部分：功能入口 ---
+@app.function(
+    image=vevc_image,
+    secrets=[modal.Secret.from_name("custom-secret")],
+    min_containers=1,
+    max_containers=1,
+    scaledown_window=1200,
+    **_modal_function_options(),
+)
+@modal.asgi_app()
+def main():
+    from fastapi import FastAPI
+    from fastapi.responses import PlainTextResponse
 
-[include]
-files = /tmp/supervisor/conf.d/*.conf
-EOF
+    start_supervisor()
+    web_app = FastAPI()
+    uuid = os.environ["U"]
 
-# 5. 產生各項服務配置
-cat > /tmp/supervisor/conf.d/services.conf <<EOF
-[program:xy]
-command=/tmp/app/start_xy.sh
-autostart=true
-autorestart=true
-environment=U="%(ENV_U)s"
+    @web_app.get("/status", response_class=PlainTextResponse)
+    async def status():
+        return "UP"
 
-[program:cf]
-command=/tmp/app/cf tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token %(ENV_T)s
-autostart=true
-autorestart=true
+    @web_app.get(f"/{uuid}", response_class=PlainTextResponse)
+    async def sub():
+        domain = os.environ["D"]
+        sub_url = f"vless://{uuid}@{domain}:443?encryption=none&security=tls&sni={domain}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host={domain}&path=%2F%3Fed%3D2560#modal-ws-argo"
+        return base64.b64encode(sub_url.encode("utf-8"))
 
-[program:td]
-command=/tmp/app/td -p 80 -W bash
-autostart=true
-autorestart=true
-
-[program:sc]
-command=/tmp/app/sc /tmp/app/my-crontab
-autostart=%(ENV_ENABLE_SC)s
-autorestart=true
-EOF
-
-# 6. Crontab 準備
-cat > /tmp/app/my-crontab <<EOF
-*/5 * * * * curl -o /dev/null -s \$E/status
-EOF
+    return web_app
